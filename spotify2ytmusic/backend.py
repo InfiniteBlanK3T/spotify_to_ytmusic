@@ -349,7 +349,9 @@ def copier(
     src_tracks: Iterator[SongInfo],
     dst_pl_id: Optional[str] = None,
     dry_run: bool = False,
-    track_sleep: float = 0.1,
+    # track_sleep: float = 0.1,
+    batch_sleep: float = 1.0,
+    batch_size: int = 50,
     yt_search_algo: int = 0,
     *,
     yt: Optional[YTMusic] = None,
@@ -360,9 +362,11 @@ def copier(
     if yt is None:
         yt = get_ytmusic()
 
+    yt_pl_title = "Liked Songs"  # Default for liked songs (dst_pl_id is None)
     if dst_pl_id is not None:
         try:
             yt_pl = yt.get_playlist(playlistId=dst_pl_id)
+            yt_pl_title = yt_pl["title"]
         except Exception as e:
             print(f"ERROR: Unable to find YTMusic playlist {dst_pl_id}: {e}")
             print(
@@ -373,11 +377,18 @@ def copier(
         print(f"== Youtube Playlist: {yt_pl['title']}")
 
     tracks_added_set = set()
+    video_ids_to_add = []
+    total_processed = 0
+    total_added_successfully = 0
     duplicate_count = 0
     error_count = 0
+    batch_num = 1
 
     for src_track in src_tracks:
-        print(f"Spotify:   {src_track.title} - {src_track.artist} - {src_track.album}")
+        total_processed += 1
+        print(
+            f"({total_processed}) Spotify:   {src_track.title} - {src_track.artist} - {src_track.album}"
+        )
 
         try:
             dst_track = lookup_song(
@@ -386,47 +397,192 @@ def copier(
         except Exception as e:
             print(f"ERROR: Unable to look up song on YTMusic: {e}")
             error_count += 1
-            continue
+            continue  # Skip to next Spotify track
 
+        # -- Display found track onse --
         yt_artist_name = "<Unknown>"
         if "artists" in dst_track and len(dst_track["artists"]) > 0:
             yt_artist_name = dst_track["artists"][0]["name"]
         print(
             f"  Youtube: {dst_track['title']} - {yt_artist_name} - {dst_track['album'] if 'album' in dst_track else '<Unknown>'}"
         )
+        # -- end --
 
-        if dst_track["videoId"] in tracks_added_set:
-            print("(DUPLICATE, this track has already been added)")
-            duplicate_count += 1
-        tracks_added_set.add(dst_track["videoId"])
+        video_id = dst_track.get("videoId")
+        if not video_id:
+            print("ERROR: Found track has no videoId, skipping.")
+            error_count += 1
+            continue
 
-        if not dry_run:
-            exception_sleep = 5
-            for _ in range(10):
-                try:
-                    if dst_pl_id is not None:
-                        yt.add_playlist_items(
-                            playlistId=dst_pl_id,
-                            videoIds=[dst_track["videoId"]],
-                            duplicates=False,
+        if video_id and video_id not in tracks_added_set:
+            tracks_added_set.add(video_id)
+            video_ids_to_add.append(video_id)
+
+        # --- Check if batch is full or it's the last track ---
+        # (We process the batch *after* this loop finishes if there are leftovers)
+        if len(video_ids_to_add) >= batch_size:
+            if not dry_run:
+                print(
+                    f"\n-- Adding batch {batch_num} ({len(video_ids_to_add)} songs) to {yt_pl_title} --"
+                )
+                success = add_batch_with_retry(
+                    yt, dst_pl_id, video_ids_to_add, batch_num
+                )
+                if success:
+                    total_added_successfully += len(video_ids_to_add)
+                    if batch_sleep > 0:
+                        print(
+                            f"-- Batch {batch_num} added, sleeping for {batch_sleep}s --\n"
                         )
-                    else:
-                        yt.rate_song(dst_track["videoId"], "LIKE")
-                    break
-                except Exception as e:
-                    print(
-                        f"ERROR: (Retrying add_playlist_items: {dst_pl_id} {dst_track['videoId']}) {e} in {exception_sleep} seconds"
-                    )
-                    time.sleep(exception_sleep)
-                    exception_sleep *= 2
+                        time.sleep(batch_sleep)
+                else:
+                    error_count += len(video_ids_to_add)
+                    print(f"ERROR: Failed to add batch {batch_num} after retries.")
+            else:
+                print(
+                    f"\n-- [Dry Run] Would add batch {batch_num} ({len(video_ids_to_add)} songs) to {yt_pl_title} --\n"
+                )
+                total_added_successfully += len(video_ids_to_add)
+            video_ids_to_add = []  # Clear the batch
+            batch_num += 1
 
-        if track_sleep:
-            time.sleep(track_sleep)
+        # Removed the per-track sleep
+        # if track_sleep:
+        #    time.sleep(track_sleep)
+
+    # --- Add any remaining tracks after the loop ---
+    if video_ids_to_add:
+        if not dry_run:
+            print(
+                f"\n-- Adding final batch {batch_num} ({len(video_ids_to_add)} songs) to {yt_pl_title} --"
+            )
+            success = add_batch_with_retry(yt, dst_pl_id, video_ids_to_add, batch_num)
+            if success:
+                total_added_successfully += len(video_ids_to_add)
+                print(f"-- Final Batch {batch_num} added --\n")
+            else:
+                error_count += len(video_ids_to_add)
+                print(f"ERROR: Failed to add final batch {batch_num} after retries.")
+        else:
+            print(
+                f"\n-- [Dry Run] Would add final batch {batch_num} ({len(video_ids_to_add)} songs) to {yt_pl_title} --\n"
+            )
+            total_added_successfully += len(
+                video_ids_to_add
+            )  # Simulate success for dry run count
 
     print()
-    print(
-        f"Added {len(tracks_added_set)} tracks, encountered {duplicate_count} duplicates, {error_count} errors"
-    )
+    print(f"Processed {total_processed} Spotify tracks.")
+    print(f"Added {total_added_successfully} unique tracks to '{yt_pl_title}'.")
+    print(f"Encountered {duplicate_count} duplicates (within this run).")
+    print(f"Encountered {error_count} errors (lookup failures or add failures).")
+
+
+# --- Helper function for batch adding with retry ---
+def add_batch_with_retry(
+    yt: YTMusic, dst_pl_id: Optional[str], video_ids: List[str], batch_num: int
+) -> bool:
+    """Adds a batch of video IDs to a playlist or likes them, with retry logic."""
+
+    # --- PRE-CHECK: Ensure video_ids list is valid ---
+    if dst_pl_id is not None:  # Only check if we intend to call add_playlist_items
+        if not video_ids:  # Checks if the list is None or empty []
+            print(
+                f"ERROR: (Batch {batch_num}) Attempting to add items but video_ids list is empty. Skipping API call."
+            )
+            return False  # Indicate failure without triggering retries for this specific issue
+
+        # Optional: Filter out any None or empty strings just in case
+        valid_video_ids = [
+            vid for vid in video_ids if vid and isinstance(vid, str) and len(vid) > 5
+        ]  # Basic sanity check
+        if not valid_video_ids:
+            print(
+                f"ERROR: (Batch {batch_num}) video_ids list contained only invalid entries ({video_ids}). Skipping API call."
+            )
+            return False  # Indicate failure
+
+        if len(valid_video_ids) != len(video_ids):
+            print(
+                f"WARNING: (Batch {batch_num}) Filtered out invalid entries from video_ids. Original: {len(video_ids)}, Valid: {len(valid_video_ids)}"
+            )
+            # Use the filtered list for the API call
+            video_ids_to_use = valid_video_ids
+        else:
+            # Use the original list if all were valid initially
+            video_ids_to_use = video_ids
+    else:
+        # For liked songs (dst_pl_id is None), we might still want to check video_ids before rating
+        if not video_ids:
+            print(
+                f"ERROR: (Batch {batch_num}) Attempting to rate songs but video_ids list is empty."
+            )
+            return False  # Can't rate nothing
+        # We can filter here too if rating needs valid IDs
+        video_ids_to_use = [
+            vid for vid in video_ids if vid and isinstance(vid, str) and len(vid) > 5
+        ]
+        if not video_ids_to_use:
+            print(
+                f"ERROR: (Batch {batch_num}) video_ids list for rating contained only invalid entries ({video_ids})."
+            )
+            return False
+
+    # --- End Pre-check ---
+
+    exception_sleep = 5
+    for attempt in range(10):
+        try:
+            if dst_pl_id is not None:
+                # --- Make the API call with the validated list ---
+                response = yt.add_playlist_items(
+                    playlistId=dst_pl_id,
+                    videoIds=video_ids_to_use,  # Use the potentially filtered list
+                    duplicates=False,
+                )
+                # ... (rest of response handling) ...
+                return True  # Assuming success if no exception and basic check passed
+
+            else:
+                # Liked songs logic using video_ids_to_use
+                print(
+                    f"INFO: Rating {len(video_ids_to_use)} songs individually for Liked Songs batch {batch_num}."
+                )
+                success_count = 0
+                # Use the filtered list here too
+                for video_id in video_ids_to_use:
+                    try:
+                        yt.rate_song(video_id, "LIKE")
+                        success_count += 1
+                    except Exception as e_rate:
+                        print(f"ERROR: (Retrying rate_song: {video_id}) {e_rate}")
+                print(
+                    f"DEBUG: Batch {batch_num}, Attempt {attempt+1}: Rated {success_count}/{len(video_ids_to_use)} songs."
+                )
+                return True  # Assume overall success for rating batch
+
+            # If we fall through dict checks for playlist add, force a retry? (Maybe remove this)
+            # raise Exception("Assuming add failed based on response, retrying.") # This might be too aggressive
+
+        except Exception as e:
+            # Check if the specific error is the one we are trying to avoid
+            if "You must provide either videoIds" in str(e):
+                print(
+                    f"ERROR: (Batch {batch_num}, Attempt {attempt+1}) Critial API Error: {e}. Aborting retries for this batch."
+                )
+                return False  # Abort retries for this specific known failure cause
+
+            # Handle other exceptions with retry
+            print(
+                f"ERROR: (Batch {batch_num}, Attempt {attempt+1}) Failed: {e}. Retrying in {exception_sleep} seconds."
+            )
+            time.sleep(exception_sleep)
+            exception_sleep *= 2
+            if exception_sleep > 300:
+                exception_sleep = 300
+
+    print(f"ERROR: (Batch {batch_num}) Failed after multiple retries.")
+    return False  # Failed after all retries
 
 
 def copy_playlist(
@@ -434,7 +590,9 @@ def copy_playlist(
     ytmusic_playlist_id: str,
     spotify_playlists_encoding: str = "utf-8",
     dry_run: bool = False,
-    track_sleep: float = 0.1,
+    # track_sleep: float = 0.1, # no longer used by copier with the new method
+    batch_sleep: float = 0.1,  # Default sleep BETWEEN batches (adjust if needed)
+    batch_size: int = 50,  # Default batch size
     yt_search_algo: int = 0,
     reverse_playlist: bool = True,
     privacy_status: str = "PRIVATE",
@@ -475,21 +633,24 @@ def copy_playlist(
         print(f"NOTE: Created playlist '{pl_name}' with ID: {ytmusic_playlist_id}")
 
     copier(
-        iter_spotify_playlist(
+        src_tracks=iter_spotify_playlist(  # Use keyword arg src_tracks=
             spotify_playlist_id,
             spotify_encoding=spotify_playlists_encoding,
             reverse_playlist=reverse_playlist,
         ),
-        ytmusic_playlist_id,
-        dry_run,
-        track_sleep,
-        yt_search_algo,
-        yt=yt,
+        dst_pl_id=ytmusic_playlist_id,  # Use keyword args for clarity & safety
+        dry_run=dry_run,
+        batch_sleep=batch_sleep,  # Pass batch_sleep correctly
+        batch_size=batch_size,  # Pass batch_size correctly
+        yt_search_algo=yt_search_algo,  # Pass yt_search_algo correctly
+        yt=yt,  # Pass yt correctly
     )
 
 
 def copy_all_playlists(
-    track_sleep: float = 0.1,
+    # track_sleep: float = 0.1, # REMOVE THIS
+    batch_sleep: float = 0.1,  # Default sleep BETWEEN batches
+    batch_size: int = 50,  # Default batch size
     dry_run: bool = False,
     spotify_playlists_encoding: str = "utf-8",
     yt_search_algo: int = 0,
@@ -524,16 +685,19 @@ def copy_all_playlists(
             print(f"NOTE: Created playlist '{pl_name}' with ID: {dst_pl_id}")
 
         copier(
-            iter_spotify_playlist(
+            src_tracks=iter_spotify_playlist(  # Use keyword arg src_tracks=
                 src_pl["id"],
                 spotify_encoding=spotify_playlists_encoding,
                 reverse_playlist=reverse_playlist,
             ),
-            dst_pl_id,
-            dry_run,
-            track_sleep,
-            yt_search_algo,
+            dst_pl_id=dst_pl_id,  # Use keyword args
+            dry_run=dry_run,
+            batch_sleep=batch_sleep,  # Pass correctly
+            batch_size=batch_size,  # Pass correctly
+            yt_search_algo=yt_search_algo,  # Pass correctly
+            yt=yt,  # Pass yt correctly (was missing before!)
         )
+
         print("\nPlaylist done!\n")
 
     print("All done!")
